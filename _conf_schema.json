@@ -4,6 +4,13 @@
         "type": "string",
         "default": "/"
     },
+    "judge_provider_id": {
+        "description": "用于判断是否触发命令的 LLM 提供商 ID",
+        "hint": "留空则沿用当前会话的聊天模型；仅影响是否触发命令的判断阶段，不改变实际执行命令时使用的当前会话模型",
+        "_special": "select_provider",
+        "type": "string",
+        "default": ""
+    },
     "show_builtin_cmds": {
         "description": "显示内置插件命令",
         "type": "bool",
@@ -11,13 +18,13 @@
     },
     "custom_cmds": {
         "description": "自定义的额外命令",
-        "hint": "一些通过正则或者监听器形成的命令无法检测，可通过自定义方式补充，格式为\"命令: 一段描述\"，分隔符为英文逗号或#",
+        "hint": "一些无法从 handler 中自动发现的命令可通过此处补充，格式为\"命令: 一段描述\" 或 \"命令#一段描述\"",
         "type": "list",
         "default": []
     },
     "plugin_blacklist": {
         "description": "插件黑名单",
-        "hint": "填写插件名称(区分大小写)，如：astrbot_plugin_help，黑名单里的插件不显示帮助",
+        "hint": "填写插件名称(区分大小写)，如：astrbot_plugin_help，黑名单中的插件不会参与命令发现与调用",
         "type": "list",
         "default": []
     }

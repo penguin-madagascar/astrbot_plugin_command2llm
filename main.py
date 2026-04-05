@@ -1,10 +1,16 @@
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.platform import AstrBotMessage, MessageMember
 from astrbot.api.message_components import Plain
 from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
+from typing import Any
+
+try:
+    from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
+except ImportError:
+    from astrbot.core.agent.tool import FunctionTool, ToolSet
+    ToolExecResult = Any
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.config import AstrBotConfig
 from astrbot.core.star.star_handler import star_handlers_registry
@@ -13,6 +19,7 @@ from astrbot.core.star.filter.command_group import CommandGroupFilter
 from difflib import SequenceMatcher
 import uuid
 import inspect
+import collections
 
 AGENT_AVAILABLE = True
 STAR_AVAILABLE = True
@@ -28,7 +35,14 @@ class Command2LLMPlugin(Star):
         self.threshold = 0.6  # 命令匹配阈值
         self.last_messages = {}  # 存储用户最后的消息
         self.wake_word = config.get('wake_word', '/')  # 获取唤醒词，默认为/
-        self.session_command_used = {}  # 记录每个会话是否已调用过命令
+        self.show_builtin_cmds = bool(config.get("show_builtin_cmds", False))
+        self.custom_cmds = config.get("custom_cmds", []) or []
+        self.plugin_blacklist = {str(item).strip() for item in (config.get("plugin_blacklist", []) or []) if str(item).strip()}
+        self.judge_provider_id = (config.get("judge_provider_id", "") or "").strip()
+        self.runtime_supported = all(
+            hasattr(self.context, attr)
+            for attr in ("tool_loop_agent", "llm_generate", "get_current_chat_provider_id")
+        )
         logger.info(f"插件初始化完成，唤醒词设置为: {self.wake_word}")
         
         
@@ -37,14 +51,16 @@ class Command2LLMPlugin(Star):
         """插件初始化方法"""
         if not STAR_AVAILABLE:
             logger.warning("Star模块不可用，插件功能受限")
+        if not self.runtime_supported:
+            logger.warning("当前 AstrBot 版本缺少 command2llm 所需的 Agent API，插件将保持加载但不会自动调用命令。建议升级到 4.5.7+。")
         logger.info("Command2LLM插件初始化完成")
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-100)
     async def handle_message(self, event, *args, **kwargs):
         """拦截所有消息，判断是否需要调用命令"""
         try:
             # 检查插件是否启用
-            if not self.enabled:
+            if not self.enabled or not self.runtime_supported:
                 return
 
             # 跳过bot自己发送的消息
@@ -55,25 +71,8 @@ class Command2LLMPlugin(Star):
 
             message_str = event.message_str.strip()
             session_id = event.session_id
-            
-            # 检查本次会话是否已经调用过命令
-            if session_id in self.session_command_used:
-                logger.info(f"会话 {session_id} 已调用过命令，跳过处理")
-                event.stop_event()
-                return
-            
-            # 首先检查是否是我们伪造的事件（通过session_id标记）
-            if hasattr(event, 'session_id') and event.session_id.endswith("_cmd2llm_fake"):
-                logger.info(f"跳过自己伪造的事件: {event.session_id}")
-                event.stop_event()
-                return
-            
-            # 检查消息对象是否是我们伪造的
-            if (hasattr(event, 'message_obj') and event.message_obj and
-                hasattr(event.message_obj, 'session_id') and
-                event.message_obj.session_id.endswith("_cmd2llm_fake")):
-                logger.info(f"跳过自己伪造的消息对象: {event.message_obj.session_id}")
-                event.stop_event()
+
+            if not message_str:
                 return
 
             # 跳过所有命令消息（让命令直接执行，不拦截）
@@ -87,27 +86,27 @@ class Command2LLMPlugin(Star):
             if any(message_str == f'{self.wake_word}{cmd}' or message_str == cmd for cmd in control_commands):
                 return
 
+            if self._event_has_result(event):
+                logger.info("消息已被其他插件处理，跳过 command2llm")
+                return
+
             # 存储最后一条消息
             self.last_messages[session_id] = message_str
 
             # 获取当前会话使用的聊天模型ID
             try:
                 umo = event.unified_msg_origin
-                provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+                current_provider_id = await self.context.get_current_chat_provider_id(umo=umo)
             except Exception:
                 return  # 无法获取提供商时跳过
             
-            if not provider_id:
+            if not current_provider_id:
                 return  # 没有LLM提供商时跳过
 
-            # 检查本次会话是否已经调用过命令
-            if session_id in self.session_command_used:
-                logger.info(f"会话 {session_id} 已调用过命令，跳过处理")
-                event.stop_event()
-                return
+            judge_provider_id = self._resolve_judge_provider_id(current_provider_id)
 
             # 使用LLM判断是否需要调用命令
-            if not await self._should_call_command(event, provider_id):
+            if not await self._should_call_command(event, judge_provider_id):
                 logger.info(f"消息不需要调用命令: {message_str}")
                 return
 
@@ -141,7 +140,7 @@ class Command2LLMPlugin(Star):
             try:
                 await self.context.tool_loop_agent(
                     event=event,
-                    chat_provider_id=provider_id,
+                    chat_provider_id=current_provider_id,
                     prompt=message_str,
                     system_prompt=system_prompt,
                     tools=tools,
@@ -150,8 +149,6 @@ class Command2LLMPlugin(Star):
                 )
 
                 logger.info("Agent处理完成")
-                # 标记会话已调用过命令
-                self.session_command_used[session_id] = True
                 # 停止事件传播，避免重复处理
                 event.stop_event()
                 return
@@ -198,6 +195,26 @@ class Command2LLMPlugin(Star):
             logger.error(f"判断命令调用时出错: {str(e)}")
             return False
 
+    def _resolve_judge_provider_id(self, current_provider_id: str) -> str:
+        """获取用于判断是否触发命令的提供商 ID"""
+        return self.judge_provider_id or current_provider_id
+
+    def _event_has_result(self, event) -> bool:
+        """检查事件是否已经被其他插件写入结果"""
+        try:
+            result = event.get_result()
+        except Exception:
+            return False
+
+        if result is None:
+            return False
+
+        chain = getattr(result, "chain", None)
+        if chain is None:
+            return True
+
+        return len(chain) > 0
+
     @filter.command("ai_enable")
     async def ai_enable(self, event, *args, **kwargs):
         """启用AI自动调用命令功能"""
@@ -215,7 +232,8 @@ class Command2LLMPlugin(Star):
         """查看AI功能状态"""
         status = "启用" if self.enabled else "禁用"
         star_status = "可用" if STAR_AVAILABLE else "不可用"
-        yield event.plain_result(f"AI自动调用命令功能当前状态: {status}\nStar模块: {star_status}\n唤醒词: {self.wake_word}")
+        runtime_status = "支持" if self.runtime_supported else "当前版本不支持"
+        yield event.plain_result(f"AI自动调用命令功能当前状态: {status}\nStar模块: {star_status}\n运行时支持: {runtime_status}\n唤醒词: {self.wake_word}")
 
     @filter.command("refresh_commands")
     async def refresh_commands(self, event, *args, **kwargs):
@@ -227,13 +245,15 @@ class Command2LLMPlugin(Star):
 
     def _get_all_commands_info(self) -> dict:
         """获取所有其他插件及其命令列表, 参考help插件的实现"""
-        import collections
         plugin_commands = collections.defaultdict(list)
         
         try:
             # 获取所有插件的元数据，并且去掉未激活的
             all_stars_metadata = self.context.get_all_stars()
-            all_stars_metadata = [star for star in all_stars_metadata if star.activated]
+            all_stars_metadata = [
+                star for star in all_stars_metadata
+                if getattr(star, "activated", True) and not getattr(star, "disabled", False)
+            ]
         except Exception as e:
             logger.error(f"获取插件列表失败: {e}")
             return {}
@@ -244,25 +264,16 @@ class Command2LLMPlugin(Star):
         
         for star in all_stars_metadata:
             plugin_name = getattr(star, "name", "未知插件")
-            plugin_instance = getattr(star, "star_cls", None)
             module_path = getattr(star, "module_path", None)
             
-            # 跳过自身和核心插件
-            if (plugin_name == "astrbot" or 
-                plugin_name == "astrbot_plugin_command2llm" or 
-                plugin_name == "astrbot-reminder"):
+            if self._should_skip_plugin(plugin_name, module_path, star):
                 continue
             
             # 进行必要的检查
-            if (not plugin_name or not module_path or 
-                not isinstance(plugin_instance, Star)):
+            if not plugin_name or not module_path:
                 logger.warning(f"插件 '{plugin_name}' (模块: {module_path}) 的元数据无效或不完整，已跳过。")
                 continue
-            
-            # 检查插件实例是否是当前插件的实例 (排除自身)
-            if plugin_instance is self:
-                continue
-            
+
             # 遍历所有注册的处理器
             for handler in star_handlers_registry:
                 # 确保处理器元数据有效且类型正确
@@ -300,8 +311,61 @@ class Command2LLMPlugin(Star):
                     # 将格式化后的命令添加到对应插件的列表中
                     if formatted_command not in plugin_commands[plugin_name]:
                         plugin_commands[plugin_name].append(formatted_command)
+
+        custom_commands = self._get_custom_commands_info()
+        if custom_commands:
+            plugin_commands["自定义命令"].extend(custom_commands)
         
         return dict(plugin_commands)
+
+    def _should_skip_plugin(self, plugin_name: str, module_path: str, star) -> bool:
+        """判断插件是否应该从命令发现中排除"""
+        normalized_module_path = (module_path or "").replace("\\", ".")
+        star_instance = getattr(star, "star_cls", None)
+
+        if plugin_name in self.plugin_blacklist:
+            return True
+
+        if plugin_name in {"command2llm", "astrbot_plugin_command2llm"}:
+            return True
+
+        if normalized_module_path == __name__ or star_instance is self:
+            return True
+
+        if not getattr(star, "activated", True) or getattr(star, "disabled", False):
+            return True
+
+        builtin_flag = getattr(star, "builtin", None)
+        reserved_flag = getattr(star, "reserved", False)
+        if not self.show_builtin_cmds and (builtin_flag is True or reserved_flag):
+            return True
+
+        if not self.show_builtin_cmds and plugin_name in {"astrbot", "astrbot-reminder"}:
+            return True
+
+        return False
+
+    def _get_custom_commands_info(self) -> list:
+        """解析用户补充的自定义命令"""
+        commands = []
+
+        for item in self.custom_cmds:
+            raw = str(item).strip()
+            if not raw:
+                continue
+
+            command_part, separator, description = raw.partition(":")
+            if not separator:
+                command_part, separator, description = raw.partition("#")
+
+            command_name = command_part.strip()
+            description = description.strip()
+            if not command_name:
+                continue
+
+            commands.append(f"{command_name}#{description}" if description else command_name)
+
+        return commands
 
     def _get_all_available_commands(self) -> list:
         """获取所有可用命令列表"""
@@ -370,21 +434,13 @@ class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
             command = kwargs.get("command", "").strip()
             if not command:
                 return "命令不能为空"
-            
+
+            if command.startswith(self.wake_word):
+                command = command[len(self.wake_word):].strip()
+
             # 获取事件对象
             event = context.context.event
-            
-            # 获取插件实例
-            plugin_instance = None
-            for star_metadata in self.context.get_all_stars():
-                if (hasattr(star_metadata, 'star_cls') and 
-                    isinstance(star_metadata.star_cls, Command2LLMPlugin)):
-                    plugin_instance = star_metadata.star_cls
-                    break
-            
-            if not plugin_instance:
-                return "无法获取插件实例"
-            
+
             # 通过框架执行命令
             try:
                 # 获取平台名称和适配器
