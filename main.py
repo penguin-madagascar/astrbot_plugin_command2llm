@@ -23,6 +23,8 @@ import collections
 
 AGENT_AVAILABLE = True
 STAR_AVAILABLE = True
+LISTEN_MODE_GLOBAL = "global"
+LISTEN_MODE_LLM_TRIGGERED_ONLY = "llm_triggered_only"
 
 @register("command2llm", "vmoranv", "让大模型能够调用所有插件命令的插件", "1.0.1")
 class Command2LLMPlugin(Star):
@@ -43,7 +45,7 @@ class Command2LLMPlugin(Star):
             hasattr(self.context, attr)
             for attr in ("tool_loop_agent", "llm_generate", "get_current_chat_provider_id")
         )
-        logger.info(f"插件初始化完成，唤醒词设置为: {self.wake_word}")
+        logger.info(f"插件初始化完成，唤醒词设置为: {self.wake_word}, 监听模式: {self._get_listen_mode()}")
         
         
 
@@ -77,7 +79,8 @@ class Command2LLMPlugin(Star):
 
             # 跳过所有命令消息（让命令直接执行，不拦截）
             logger.info(f"检查消息: '{message_str}', 唤醒词: '{self.wake_word}'")
-            if message_str.startswith(self.wake_word) or message_str.startswith('#') or message_str.startswith('!'):
+            command_prefixes = {self.wake_word, '/', '#', '!'}
+            if any(prefix and message_str.startswith(prefix) for prefix in command_prefixes):
                 logger.info(f"跳过命令消息: {message_str}")
                 return
 
@@ -88,6 +91,10 @@ class Command2LLMPlugin(Star):
 
             if self._event_has_result(event):
                 logger.info("消息已被其他插件处理，跳过 command2llm")
+                return
+
+            if not self._should_process_in_listen_mode(event):
+                logger.info("消息未触发 AstrBot LLM，跳过 command2llm")
                 return
 
             # 存储最后一条消息
@@ -199,6 +206,110 @@ class Command2LLMPlugin(Star):
         """获取用于判断是否触发命令的提供商 ID"""
         return self.judge_provider_id or current_provider_id
 
+    def _get_listen_mode(self) -> str:
+        """获取消息监听模式"""
+        listen_mode = str(self.config.get("listen_mode", LISTEN_MODE_GLOBAL) or LISTEN_MODE_GLOBAL).strip()
+        if listen_mode not in {LISTEN_MODE_GLOBAL, LISTEN_MODE_LLM_TRIGGERED_ONLY}:
+            return LISTEN_MODE_GLOBAL
+        return listen_mode
+
+    def _should_process_in_listen_mode(self, event) -> bool:
+        """根据监听模式判断是否处理当前消息"""
+        if self._get_listen_mode() == LISTEN_MODE_GLOBAL:
+            return True
+        return self._is_llm_triggered_message(event)
+
+    def _is_llm_triggered_message(self, event) -> bool:
+        """判断当前消息是否本来会触发 AstrBot LLM 回复"""
+        is_at_or_wake_command = getattr(event, "is_at_or_wake_command", None)
+        if is_at_or_wake_command:
+            return True
+
+        if self._private_message_triggers_llm(event):
+            return True
+
+        if is_at_or_wake_command is False:
+            return False
+
+        return self._is_bot_mentioned(event) or self._has_global_wake_prefix(event)
+
+    def _private_message_triggers_llm(self, event) -> bool:
+        """兼容旧事件对象：私聊默认触发 LLM，除非全局配置要求唤醒词"""
+        if not self._is_private_message(event):
+            return False
+
+        platform_settings = self._config_get(self._get_global_config(), "platform_settings", {}) or {}
+        needs_wake_prefix = bool(self._config_get(platform_settings, "friend_message_needs_wake_prefix", False))
+        return not needs_wake_prefix or self._has_global_wake_prefix(event)
+
+    def _is_private_message(self, event) -> bool:
+        get_message_type = getattr(event, "get_message_type", None)
+        if callable(get_message_type):
+            message_type = get_message_type()
+            message_type_text = str(getattr(message_type, "name", message_type)).lower()
+            if "group" in message_type_text:
+                return False
+            if "private" in message_type_text or "friend" in message_type_text:
+                return True
+
+        get_group_id = getattr(event, "get_group_id", None)
+        if callable(get_group_id):
+            return not bool(get_group_id())
+
+        message_obj = getattr(event, "message_obj", None)
+        return not bool(getattr(message_obj, "group_id", None))
+
+    def _is_bot_mentioned(self, event) -> bool:
+        message_obj = getattr(event, "message_obj", None)
+        self_id = str(getattr(message_obj, "self_id", "") or "")
+        if not self_id:
+            return False
+
+        for component in getattr(message_obj, "message", []) or []:
+            if component.__class__.__name__ == "At" and str(getattr(component, "qq", "")) == self_id:
+                return True
+        return False
+
+    def _has_global_wake_prefix(self, event) -> bool:
+        message_str = self._get_event_message_str(event)
+        if not message_str:
+            return False
+
+        global_config = self._get_global_config()
+        provider_settings = self._config_get(global_config, "provider_settings", {}) or {}
+        wake_prefixes = []
+        wake_prefixes.extend(self._normalize_prefixes(self._config_get(global_config, "wake_prefix", [])))
+        wake_prefixes.extend(self._normalize_prefixes(self._config_get(provider_settings, "wake_prefix", "")))
+        return any(message_str.startswith(prefix) for prefix in wake_prefixes)
+
+    def _get_event_message_str(self, event) -> str:
+        get_message_str = getattr(event, "get_message_str", None)
+        if callable(get_message_str):
+            message_str = get_message_str()
+            if isinstance(message_str, str):
+                return message_str.strip()
+        return str(getattr(event, "message_str", "") or "").strip()
+
+    def _get_global_config(self):
+        get_config = getattr(self.context, "get_config", None)
+        if callable(get_config):
+            return get_config()
+        return {}
+
+    def _config_get(self, config, key, default=None):
+        getter = getattr(config, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        return default
+
+    def _normalize_prefixes(self, raw_prefixes) -> list[str]:
+        if isinstance(raw_prefixes, str):
+            raw_prefixes = [raw_prefixes]
+        elif not isinstance(raw_prefixes, (list, tuple, set)):
+            return []
+
+        return [str(prefix).strip() for prefix in raw_prefixes if str(prefix).strip()]
+
     def _event_has_result(self, event) -> bool:
         """检查事件是否已经被其他插件写入结果"""
         try:
@@ -233,7 +344,7 @@ class Command2LLMPlugin(Star):
         status = "启用" if self.enabled else "禁用"
         star_status = "可用" if STAR_AVAILABLE else "不可用"
         runtime_status = "支持" if self.runtime_supported else "当前版本不支持"
-        yield event.plain_result(f"AI自动调用命令功能当前状态: {status}\nStar模块: {star_status}\n运行时支持: {runtime_status}\n唤醒词: {self.wake_word}")
+        yield event.plain_result(f"AI自动调用命令功能当前状态: {status}\nStar模块: {star_status}\n运行时支持: {runtime_status}\n唤醒词: {self.wake_word}\n监听模式: {self._get_listen_mode()}")
 
     @filter.command("refresh_commands")
     async def refresh_commands(self, event, *args, **kwargs):
@@ -512,7 +623,5 @@ class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
         except Exception as e:
             logger.error(f"工具调用失败: {str(e)}")
             return f"工具调用失败: {str(e)}"
-
-
 
 

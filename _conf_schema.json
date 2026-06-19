@@ -4,6 +4,20 @@
         "type": "string",
         "default": "/"
     },
+    "listen_mode": {
+        "description": "消息监听模式",
+        "hint": "全局监听会保持旧行为，处理所有非命令消息；仅 LLM 触发消息只处理本来会触发 AstrBot LLM 回复的消息，如 @机器人或全局唤醒词。",
+        "type": "string",
+        "options": [
+            "global",
+            "llm_triggered_only"
+        ],
+        "labels": [
+            "全局监听",
+            "仅 LLM 触发消息"
+        ],
+        "default": "global"
+    },
     "judge_provider_id": {
         "description": "用于判断是否触发命令的 LLM 提供商 ID",
         "hint": "留空则沿用当前会话的聊天模型；仅影响是否触发命令的判断阶段，不改变实际执行命令时使用的当前会话模型",
