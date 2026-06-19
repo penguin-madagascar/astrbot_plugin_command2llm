@@ -32,7 +32,7 @@ class RegisteredCommand:
     event_filters: tuple[Any, ...]
 
 
-@register("command2llm", "vmoranv", "让大模型能够调用所有插件命令的插件", "1.0.1")
+@register("command2llm", "vmoranv", "让大模型能够调用所有插件命令的插件", "1.0.2")
 class Command2LLMPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
