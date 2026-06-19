@@ -1,10 +1,14 @@
+import collections
+import copy
+import inspect
+from dataclasses import dataclass
+from typing import Any
+
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.platform import AstrBotMessage, MessageMember
 from astrbot.api.message_components import Plain
 from astrbot.core.agent.run_context import ContextWrapper
-from typing import Any
 
 try:
     from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
@@ -16,15 +20,22 @@ from astrbot.core.config import AstrBotConfig
 from astrbot.core.star.star_handler import star_handlers_registry
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
-from difflib import SequenceMatcher
-import uuid
-import inspect
-import collections
 
 AGENT_AVAILABLE = True
 STAR_AVAILABLE = True
 LISTEN_MODE_GLOBAL = "global"
 LISTEN_MODE_LLM_TRIGGERED_ONLY = "llm_triggered_only"
+
+
+@dataclass(frozen=True)
+class RegisteredCommand:
+    name: str
+    description: str
+    plugin_name: str
+    handler: Any
+    command_filter: Any
+    event_filters: tuple[Any, ...]
+
 
 @register("command2llm", "vmoranv", "让大模型能够调用所有插件命令的插件", "1.0.1")
 class Command2LLMPlugin(Star):
@@ -122,13 +133,17 @@ class Command2LLMPlugin(Star):
                 logger.error("Agent模块不可用")
                 return
                 
-            commands_list = self._get_all_available_commands()
+            registered_commands = self._get_registered_commands()
+            commands_list = self._get_all_available_commands(registered_commands)
             logger.info(f"可用命令列表: {commands_list[:10]}...")  # 只显示前10个
             
             # 创建工具集合
-            tools = ToolSet([
-                ExecuteCommandTool(self.context, self.wake_word)
-            ])
+            command_tool = ExecuteCommandTool(
+                registered_commands,
+                self._get_global_config(),
+                self.wake_word,
+            )
+            tools = ToolSet([command_tool])
             
             # 构建系统提示
             system_prompt = f"""你是一个命令执行助手，负责根据用户消息选择合适的命令并执行。
@@ -354,12 +369,12 @@ class Command2LLMPlugin(Star):
 
     
 
-    def _get_all_commands_info(self) -> dict:
-        """获取所有其他插件及其命令列表, 参考help插件的实现"""
-        plugin_commands = collections.defaultdict(list)
-        
+    def _get_registered_commands(self) -> list[RegisteredCommand]:
+        """从已启用插件的 handler 注册表构建可执行命令索引"""
+        registered_commands = []
+        seen_commands = set()
+
         try:
-            # 获取所有插件的元数据，并且去掉未激活的
             all_stars_metadata = self.context.get_all_stars()
             all_stars_metadata = [
                 star for star in all_stars_metadata
@@ -371,62 +386,102 @@ class Command2LLMPlugin(Star):
         
         if not all_stars_metadata:
             logger.warning("没有找到任何插件")
-            return {}
-        
+            return []
+
         for star in all_stars_metadata:
             plugin_name = getattr(star, "name", "未知插件")
             module_path = getattr(star, "module_path", None)
-            
+
             if self._should_skip_plugin(plugin_name, module_path, star):
                 continue
-            
-            # 进行必要的检查
+
             if not plugin_name or not module_path:
                 logger.warning(f"插件 '{plugin_name}' (模块: {module_path}) 的元数据无效或不完整，已跳过。")
                 continue
 
-            # 遍历所有注册的处理器
             for handler in star_handlers_registry:
-                # 确保处理器元数据有效且类型正确
-                if not hasattr(handler, 'handler_module_path'):
+                if (
+                    getattr(handler, "handler_module_path", None) != module_path
+                    or not getattr(handler, "enabled", True)
+                ):
                     continue
-                
-                # 检查此处理器是否属于当前遍历的插件 (通过模块路径匹配)
-                if handler.handler_module_path != module_path:
-                    continue
-                
-                command_name = None
-                description = getattr(handler, 'desc', None)
-                
-                # 遍历处理器的过滤器，查找命令或命令组
-                if hasattr(handler, 'event_filters'):
-                    for filter_ in handler.event_filters:
-                        if CommandFilter and isinstance(filter_, CommandFilter):
-                            # 获取父命令名
-                            parent_names = getattr(filter_, 'parent_command_names', [''])
-                            full_command = f"{parent_names[0]} {filter_.command_name}".strip()
-                            command_name = full_command
-                            break
-                        elif CommandGroupFilter and isinstance(filter_, CommandGroupFilter):
-                            command_name = filter_.group_name
-                            break
-                
-                # 如果找到了命令或命令组名称
-                if command_name:
-                    # 格式化字符串
-                    if description:
-                        formatted_command = f"{command_name}#{description}"
-                    else:
-                        formatted_command = command_name
-                    
-                    # 将格式化后的命令添加到对应插件的列表中
-                    if formatted_command not in plugin_commands[plugin_name]:
-                        plugin_commands[plugin_name].append(formatted_command)
+
+                event_filters = tuple(getattr(handler, "event_filters", ()) or ())
+                for command_filter in event_filters:
+                    if not isinstance(command_filter, (CommandFilter, CommandGroupFilter)):
+                        continue
+
+                    for command_name in self._get_complete_command_names(command_filter):
+                        command_key = (
+                            command_name,
+                            getattr(handler, "handler_full_name", id(handler)),
+                        )
+                        if command_key in seen_commands:
+                            continue
+                        seen_commands.add(command_key)
+
+                        registered_commands.append(
+                            RegisteredCommand(
+                                name=command_name,
+                                description=getattr(handler, "desc", "") or "",
+                                plugin_name=plugin_name,
+                                handler=handler.handler,
+                                command_filter=command_filter,
+                                event_filters=event_filters,
+                            )
+                        )
+
+        return registered_commands
+
+    def _get_complete_command_names(self, command_filter) -> list[str]:
+        """获取命令及其别名对应的完整名称"""
+        get_complete_names = getattr(command_filter, "get_complete_command_names", None)
+        if callable(get_complete_names):
+            names = get_complete_names()
+        elif isinstance(command_filter, CommandFilter):
+            names = [
+                f"{parent} {command}".strip()
+                for parent in getattr(command_filter, "parent_command_names", [""])
+                for command in [
+                    getattr(command_filter, "command_name", ""),
+                    *getattr(command_filter, "alias", set()),
+                ]
+            ]
+        else:
+            names = [
+                getattr(command_filter, "group_name", ""),
+                *getattr(command_filter, "alias", set()),
+            ]
+
+        return [
+            " ".join(str(command_name).split())
+            for command_name in names
+            if str(command_name).strip()
+        ]
+
+    def _get_all_commands_info(
+        self,
+        registered_commands: list[RegisteredCommand] | None = None,
+    ) -> dict:
+        """获取所有其他插件及其命令列表, 参考help插件的实现"""
+        plugin_commands = collections.defaultdict(list)
+
+        if registered_commands is None:
+            registered_commands = self._get_registered_commands()
+
+        for command in registered_commands:
+            formatted_command = (
+                f"{command.name}#{command.description}"
+                if command.description
+                else command.name
+            )
+            if formatted_command not in plugin_commands[command.plugin_name]:
+                plugin_commands[command.plugin_name].append(formatted_command)
 
         custom_commands = self._get_custom_commands_info()
         if custom_commands:
             plugin_commands["自定义命令"].extend(custom_commands)
-        
+
         return dict(plugin_commands)
 
     def _should_skip_plugin(self, plugin_name: str, module_path: str, star) -> bool:
@@ -478,41 +533,24 @@ class Command2LLMPlugin(Star):
 
         return commands
 
-    def _get_all_available_commands(self) -> list:
+    def _get_all_available_commands(
+        self,
+        registered_commands: list[RegisteredCommand] | None = None,
+    ) -> list:
         """获取所有可用命令列表"""
         try:
-            commands_info = self._get_all_commands_info()
+            commands_info = self._get_all_commands_info(registered_commands)
             commands = []
-            for plugin_name, cmd_list in commands_info.items():
+            for cmd_list in commands_info.values():
                 for cmd in cmd_list:
                     # 提取命令名（去掉描述部分）
                     command_name = cmd.split('#')[0].strip()
-                    if command_name:
+                    if command_name and command_name not in commands:
                         commands.append(command_name)
             return commands
         except Exception as e:
             logger.error(f"获取命令列表失败: {str(e)}")
             return []
-
-    def _find_best_command_match(self, message: str, commands: list) -> tuple:
-        """查找最佳匹配的命令"""
-        best_match = None
-        best_ratio = 0
-        
-        # 提取消息的第一部分作为命令候选
-        message_parts = message.split()
-        if not message_parts:
-            return None
-        
-        command_candidate = message_parts[0]
-        
-        for cmd in commands:
-            ratio = SequenceMatcher(None, command_candidate, cmd).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_match = (cmd, ratio)
-        
-        return best_match
 
     
 
@@ -524,9 +562,20 @@ class Command2LLMPlugin(Star):
 class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
     """执行插件命令的工具"""
     
-    def __init__(self, context: Context, wake_word: str = "/"):
-        self.context = context
+    def __init__(
+        self,
+        commands: list[RegisteredCommand],
+        config,
+        wake_word: str = "/",
+    ):
+        self.commands = sorted(commands, key=lambda item: len(item.name), reverse=True)
+        self.config = config
         self.wake_word = wake_word
+        self.called = False
+        self.executed = False
+        self.completed = False
+        self.sent_count = 0
+        self.last_command = ""
         self.name = "execute_command"
         self.description = "执行指定的插件命令"
         self.parameters = {
@@ -541,87 +590,187 @@ class ExecuteCommandTool(FunctionTool[AstrAgentContext]):
         }
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
+        self.called = True
+
         try:
-            command = kwargs.get("command", "").strip()
+            command = self._normalize_command(kwargs.get("command", ""))
             if not command:
                 return "命令不能为空"
 
-            if command.startswith(self.wake_word):
-                command = command[len(self.wake_word):].strip()
-
-            # 获取事件对象
+            self.last_command = command
             event = context.context.event
+            registered_command = self._find_registered_command(command)
+            if registered_command is None:
+                return f"未找到可同步执行的命令: {command}"
 
-            # 通过框架执行命令
             try:
-                # 获取平台名称和适配器
-                platform_name = event.get_platform_name()
-                platform_obj = self.context.get_platform(platform_name)
-                
-                if not platform_obj:
-                    logger.error("无法获取平台对象")
-                    return "内部错误，无法确定平台"
-                
-                # 构造伪造的 AstrBotMessage
-                fake_message = AstrBotMessage()
-                fake_message.type = event.message_obj.type if hasattr(event, 'message_obj') and event.message_obj else "text"
-                fake_message.message_str = f"{self.wake_word}{command}"
-                fake_message.message = [Plain(text=f"{self.wake_word}{command}")]
-                fake_message.self_id = event.message_obj.self_id if hasattr(event, 'message_obj') and event.message_obj else 0
-                fake_message.session_id = f"{event.session_id}_cmd2llm_fake"
-                fake_message.message_id = str(uuid.uuid4())
-                
-                # 设置发送者信息
-                if hasattr(event, 'message_obj') and event.message_obj:
-                    # 获取发送者信息
-                    sender_id = event.get_sender_id()
-                    sender_name = event.get_sender_name()
-                    if sender_id:
-                        fake_message.sender = MessageMember(user_id=sender_id, nickname=sender_name)
-                
-                # 设置raw_message
-                try:
-                    if hasattr(event, 'message_obj') and event.message_obj and hasattr(event.message_obj, 'raw_message'):
-                        fake_message.raw_message = event.message_obj.raw_message
-                    else:
-                        fake_message.raw_message = {}
-                except AttributeError:
-                    fake_message.raw_message = {}
-                
-                # 创建伪造事件
-                OriginalEventClass = event.__class__
-                
-                # 准备构造函数参数
-                kwargs_event = {
-                    "message_str": f"{self.wake_word}{command}",
-                    "message_obj": fake_message,
-                    "platform_meta": platform_obj.meta(),
-                    "session_id": fake_message.session_id,
-                }
-                
-                # 检查原始事件类的 __init__ 是否接受 'bot' 参数
-                try:
-                    sig = inspect.signature(OriginalEventClass.__init__)
-                    if 'bot' in sig.parameters:
-                        kwargs_event['bot'] = event.bot
-                        logger.debug("事件构造函数接受 'bot' 参数")
-                except Exception as e:
-                    logger.warning(f"无法检查事件构造函数签名: {e}")
-                
-                fake_event = OriginalEventClass(**kwargs_event)
-                
-                logger.info(f"通过工具执行命令: {self.wake_word}{command}")
-                platform_obj.commit_event(fake_event)
-                logger.info(f"命令 {self.wake_word}{command} 已提交到框架执行，结果将直接显示给用户")
-                
-                return f"命令 '{command}' 已执行，结果将显示在聊天中"
-                
+                command_event = self._create_command_event(event, command)
+                filter_error = await self._validate_event_filters(
+                    registered_command,
+                    command_event,
+                )
+                if filter_error:
+                    return filter_error
+
+                parsed_params = self._get_parsed_params(command_event)
+                sent_before = self.sent_count
+                sent_result_ids = set()
+
+                async def forward_result(result):
+                    return await self._send_result(event, result, sent_result_ids)
+
+                command_event.send = forward_result
+                self.executed = True
+
+                logger.info(
+                    f"通过注册处理器执行命令: {registered_command.plugin_name}/"
+                    f"{registered_command.name}"
+                )
+                handler_result = registered_command.handler(
+                    command_event,
+                    **parsed_params,
+                )
+                await self._consume_handler_result(
+                    event,
+                    handler_result,
+                    sent_result_ids,
+                )
+                await self._send_event_result(
+                    event,
+                    command_event,
+                    sent_result_ids,
+                )
+
+                self.completed = True
+                sent_count = self.sent_count - sent_before
+                if sent_count:
+                    return f"命令 '{command}' 已执行并发送 {sent_count} 条结果"
+                return f"命令 '{command}' 已执行完成，但没有产生可发送结果"
             except Exception as e:
                 logger.error(f"执行命令时出错: {str(e)}")
                 return f"执行命令失败: {str(e)}"
-                
+
         except Exception as e:
             logger.error(f"工具调用失败: {str(e)}")
             return f"工具调用失败: {str(e)}"
 
+    def _normalize_command(self, command: str) -> str:
+        command = str(command or "").strip()
+        if self.wake_word and command.startswith(self.wake_word):
+            command = command[len(self.wake_word):].strip()
+        return " ".join(command.split())
 
+    def _find_registered_command(self, command: str) -> RegisteredCommand | None:
+        for registered_command in self.commands:
+            if (
+                command == registered_command.name
+                or command.startswith(f"{registered_command.name} ")
+            ):
+                return registered_command
+        return None
+
+    def _create_command_event(self, event, command: str):
+        message_obj = copy.copy(event.message_obj)
+        message_obj.message_str = command
+        message_obj.message = [Plain(text=command)]
+        message_obj.session_id = event.session_id
+
+        event_class = event.__class__
+        event_kwargs = {
+            "message_str": command,
+            "message_obj": message_obj,
+            "platform_meta": event.platform_meta,
+            "session_id": event.session_id,
+        }
+
+        signature = inspect.signature(event_class.__init__)
+        if "bot" in signature.parameters and hasattr(event, "bot"):
+            event_kwargs["bot"] = event.bot
+
+        command_event = event_class(**event_kwargs)
+        command_event.role = getattr(event, "role", "member")
+        command_event.is_wake = True
+        command_event.is_at_or_wake_command = True
+
+        if hasattr(event, "plugins_name"):
+            command_event.plugins_name = event.plugins_name
+        if hasattr(event, "_extras"):
+            command_event._extras = copy.copy(event._extras)
+
+        return command_event
+
+    async def _validate_event_filters(
+        self,
+        registered_command: RegisteredCommand,
+        command_event,
+    ) -> str | None:
+        try:
+            for event_filter in registered_command.event_filters:
+                filter_method = getattr(event_filter, "filter", None)
+                if not callable(filter_method):
+                    continue
+
+                passed = filter_method(command_event, self.config)
+                if inspect.isawaitable(passed):
+                    passed = await passed
+                if not passed:
+                    return (
+                        f"当前会话不满足命令 '{registered_command.name}' "
+                        "的执行条件"
+                    )
+        except ValueError as e:
+            return f"命令参数错误: {str(e)}"
+
+        return None
+
+    def _get_parsed_params(self, command_event) -> dict:
+        get_extra = getattr(command_event, "get_extra", None)
+        if callable(get_extra):
+            return get_extra("parsed_params") or {}
+        return getattr(command_event, "_extras", {}).get("parsed_params", {})
+
+    async def _consume_handler_result(
+        self,
+        event,
+        handler_result,
+        sent_result_ids: set[int],
+    ) -> None:
+        if inspect.isasyncgen(handler_result):
+            async for result in handler_result:
+                await self._send_result(event, result, sent_result_ids)
+        elif inspect.isawaitable(handler_result):
+            result = await handler_result
+            await self._send_result(event, result, sent_result_ids)
+        else:
+            await self._send_result(event, handler_result, sent_result_ids)
+
+    async def _send_event_result(
+        self,
+        event,
+        command_event,
+        sent_result_ids: set[int],
+    ) -> None:
+        get_result = getattr(command_event, "get_result", None)
+        if not callable(get_result):
+            return
+
+        result = get_result()
+        if result is not None and id(result) not in sent_result_ids:
+            await self._send_result(event, result, sent_result_ids)
+
+    async def _send_result(
+        self,
+        event,
+        result,
+        sent_result_ids: set[int],
+    ):
+        if result is None:
+            return None
+
+        if isinstance(result, str):
+            result = event.plain_result(result)
+
+        send_result = await event.send(result)
+        sent_result_ids.add(id(result))
+        self.sent_count += 1
+        return send_result
