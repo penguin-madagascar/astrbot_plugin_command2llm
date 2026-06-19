@@ -171,8 +171,11 @@ class Command2LLMPlugin(Star):
                 )
 
                 logger.info("Agent处理完成")
-                # 停止事件传播，避免重复处理
-                event.stop_event()
+                command_handled = command_tool.completed or command_tool.sent_count > 0
+                if command_handled or self._event_has_result(event):
+                    event.stop_event()
+                else:
+                    logger.info("Agent未执行有效命令且未产生回复，继续事件传播")
                 return
             except Exception as e:
                 logger.error(f"Agent调用失败: {str(e)}")
