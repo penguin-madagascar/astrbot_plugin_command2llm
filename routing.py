@@ -8,15 +8,21 @@ class RouteDecision:
     arguments: str
 
 
-def parse_route_decision(response_text: str, command_count: int) -> RouteDecision | None:
-    """Parse the command router's JSON response."""
+def _parse_json_object(response_text: str) -> dict:
     text = str(response_text or "").strip()
     start = text.find("{")
     end = text.rfind("}")
     if start < 0 or end < start:
-        raise ValueError("路由模型未返回 JSON 对象")
+        raise ValueError("模型未返回 JSON 对象")
+    payload = json.loads(text[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("模型返回值必须是 JSON 对象")
+    return payload
 
-    payload = json.loads(text[start:end + 1])
+
+def parse_route_decision(response_text: str, command_count: int) -> RouteDecision | None:
+    """Parse the command router's JSON response."""
+    payload = _parse_json_object(response_text)
     command_id = payload.get("command_id")
     if command_id is None:
         return None
@@ -36,6 +42,15 @@ def parse_route_decision(response_text: str, command_count: int) -> RouteDecisio
         command_id=command_id,
         arguments=" ".join(arguments.split()),
     )
+
+
+def parse_agent_trigger_decision(response_text: str) -> bool:
+    """Parse whether a non-LLM-triggered message should start the agent."""
+    payload = _parse_json_object(response_text)
+    use_agent = payload.get("use_agent")
+    if not isinstance(use_agent, bool):
+        raise ValueError("use_agent 必须是布尔值")
+    return use_agent
 
 
 def build_command_line(command_name: str, arguments: str) -> str:
