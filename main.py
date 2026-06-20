@@ -57,7 +57,7 @@ class Command2LLMPlugin(Star):
         )
         configured_tool_types = config.get(
             "agent_tool_types",
-            [TOOL_TYPE_COMMAND, TOOL_TYPE_NATIVE],
+            [TOOL_TYPE_COMMAND],
         )
         self.allowed_tool_types = {
             str(item).strip()

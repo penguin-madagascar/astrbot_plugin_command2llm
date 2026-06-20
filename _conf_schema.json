@@ -38,8 +38,7 @@
             "插件原生 LLM 工具"
         ],
         "default": [
-            "command",
-            "native_tool"
+            "command"
         ]
     },
     "enable_multi_tool_agent": {
