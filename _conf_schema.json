@@ -19,27 +19,71 @@
         "default": "global"
     },
     "judge_provider_id": {
-        "description": "用于判断是否触发命令的 LLM 提供商 ID",
-        "hint": "留空则沿用当前会话的聊天模型；仅影响是否触发命令的判断阶段，不改变实际执行命令时使用的当前会话模型",
+        "description": "用于命令路由和全局消息预判的 LLM 提供商 ID",
+        "hint": "留空则沿用当前会话聊天模型；单命令模式用它完成结构化命令路由，多轮模式仅在 global 监听的普通消息上用它判断是否启动 Agent",
         "_special": "select_provider",
         "type": "string",
         "default": ""
+    },
+    "agent_tool_types": {
+        "description": "允许的插件工具类型",
+        "hint": "该选项同时作用于单命令路由和多轮模式。普通命令会被转换为独立 FunctionTool；原生 LLM 工具遵守 AstrBot 当前人设的工具选择。AstrBot 内置工具、MCP 和 handoff 不受此选项影响",
+        "type": "list",
+        "options": [
+            "command",
+            "native_tool"
+        ],
+        "labels": [
+            "普通插件命令",
+            "插件原生 LLM 工具"
+        ],
+        "default": [
+            "command",
+            "native_tool"
+        ]
+    },
+    "enable_multi_tool_agent": {
+        "description": "启用多轮工具调用",
+        "hint": "开启后复用 AstrBot 原生 Agent，在一次回复中可多次调用插件命令或原生 LLM 工具，并根据工具结果继续调用或生成最终回复",
+        "type": "bool",
+        "default": false
+    },
+    "multi_tool_limits": {
+        "description": "多轮工具调用限制",
+        "hint": "以下限制只作用于本插件允许的普通插件命令和插件原生 LLM 工具；负数表示不额外限制",
+        "type": "object",
+        "condition": {
+            "enable_multi_tool_agent": true
+        },
+        "items": {
+            "max_calls_per_round": {
+                "description": "单轮调用上限",
+                "hint": "同一次 LLM 响应中最多执行的插件工具数量；负数表示不限制",
+                "type": "int",
+                "default": -1
+            },
+            "max_call_rounds": {
+                "description": "最大调用轮数",
+                "hint": "一次回复中允许执行插件工具的最大 LLM 轮数；负数表示不限制，AstrBot 全局 max_agent_step 仍作为最终保护",
+                "type": "int",
+                "default": -1
+            }
+        }
     },
     "show_builtin_cmds": {
         "description": "显示内置插件命令",
         "type": "bool",
         "default": false
     },
-    "custom_cmds": {
-        "description": "自定义的额外命令",
-        "hint": "兼容旧配置保留；没有注册 handler 的自定义命令不会进入可执行路由目录",
-        "type": "list",
-        "default": []
-    },
     "plugin_blacklist": {
         "description": "插件黑名单",
-        "hint": "填写插件名称(区分大小写)，如：astrbot_plugin_help，黑名单中的插件不会参与命令发现与调用",
+        "hint": "选中的插件，其普通命令和原生 LLM 工具都不会参与判断或调用。按插件唯一名保存，也兼容识别现有配置中的展示名",
         "type": "list",
+        "_special": "select_plugin_set",
+        "_special_dialog_title": "选择禁用插件集合",
+        "_special_all_label": "禁用所有插件",
+        "_special_none_label": "不禁用任何插件",
+        "_special_custom_label": "自定义禁用",
         "default": []
     }
 }
