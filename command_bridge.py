@@ -10,6 +10,7 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.star_handler import star_handlers_registry
 
 
@@ -87,6 +88,24 @@ class CommandRegistry:
                 str(getattr(matched, "name", "") or configured_name)
             )
         return effective
+
+    def has_activated_command_handler(self, event) -> bool:
+        """Return whether AstrBot already matched this event to a command."""
+        get_extra = getattr(event, "get_extra", None)
+        if callable(get_extra):
+            activated_handlers = get_extra("activated_handlers") or ()
+        else:
+            activated_handlers = getattr(event, "_extras", {}).get(
+                "activated_handlers",
+                (),
+            )
+
+        command_filter_types = (CommandFilter, CommandGroupFilter)
+        return any(
+            isinstance(event_filter, command_filter_types)
+            for handler in activated_handlers
+            for event_filter in (getattr(handler, "event_filters", ()) or ())
+        )
 
     def discover_commands(self, event=None) -> list[RegisteredCommand]:
         commands: list[RegisteredCommand] = []

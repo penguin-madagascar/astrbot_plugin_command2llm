@@ -80,10 +80,6 @@
         "hint": "选中的插件，其普通命令和原生 LLM 工具都不会参与判断或调用。按插件唯一名保存，也兼容识别现有配置中的展示名",
         "type": "list",
         "_special": "select_plugin_set",
-        "_special_dialog_title": "选择禁用插件集合",
-        "_special_all_label": "禁用所有插件",
-        "_special_none_label": "不禁用任何插件",
-        "_special_custom_label": "自定义禁用",
         "default": []
     }
 }

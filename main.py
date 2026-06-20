@@ -102,7 +102,7 @@ class Command2LLMPlugin(Star):
             return
 
         message_str = self._get_event_message_str(event)
-        if not message_str or self._is_command_message(message_str):
+        if not message_str or self._is_explicit_command_event(event, message_str):
             return
         if self._event_has_result(event):
             logger.info("消息已被其他插件处理，跳过 command2llm")
@@ -128,7 +128,7 @@ class Command2LLMPlugin(Star):
         **kwargs,
     ) -> None:
         """Filter plugin tools and optionally inject command tools."""
-        if not self.enabled or not (
+        if not self.enabled or self._is_explicit_command_event(event) or not (
             self._get_event_extra(event, TOOL_POLICY_EVENT_MARKER)
             or self._get_event_extra(event, AGENT_EVENT_MARKER)
         ):
@@ -453,6 +453,26 @@ class Command2LLMPlugin(Star):
             if isinstance(message_str, str):
                 return message_str.strip()
         return str(getattr(event, "message_str", "") or "").strip()
+
+    def _get_original_message_str(self, event) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        return str(getattr(message_obj, "message_str", "") or "").strip()
+
+    def _is_explicit_command_event(
+        self,
+        event,
+        processed_message_str: str | None = None,
+    ) -> bool:
+        processed_message_str = (
+            self._get_event_message_str(event)
+            if processed_message_str is None
+            else processed_message_str
+        )
+        return (
+            self._is_command_message(processed_message_str)
+            or self._is_command_message(self._get_original_message_str(event))
+            or self.command_registry.has_activated_command_handler(event)
+        )
 
     def _get_global_config(self, event=None):
         get_config = getattr(self.context, "get_config", None)
