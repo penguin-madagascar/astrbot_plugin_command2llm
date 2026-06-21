@@ -211,3 +211,6 @@ __marimo__/
 
 # Tests
 tests/
+
+# Data
+data/

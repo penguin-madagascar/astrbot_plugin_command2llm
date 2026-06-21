@@ -84,9 +84,7 @@ class CommandRegistry:
                 ),
                 None,
             )
-            effective.append(
-                str(getattr(matched, "name", "") or configured_name)
-            )
+            effective.append(str(getattr(matched, "name", "") or configured_name))
         return effective
 
     def has_activated_command_handler(self, event) -> bool:
@@ -121,10 +119,9 @@ class CommandRegistry:
                 continue
 
             for handler in star_handlers_registry:
-                if (
-                    getattr(handler, "handler_module_path", None) != module_path
-                    or not getattr(handler, "enabled", True)
-                ):
+                if getattr(
+                    handler, "handler_module_path", None
+                ) != module_path or not getattr(handler, "enabled", True):
                     continue
 
                 event_filters = tuple(getattr(handler, "event_filters", ()) or ())
@@ -185,6 +182,7 @@ class CommandRegistry:
             if (
                 star is None
                 or getattr(star, "reserved", False)
+                or not getattr(tool, "active", True)
                 or not self._is_native_plugin_allowed(star, event)
             ):
                 continue
@@ -220,7 +218,11 @@ class CommandRegistry:
             if star is None or getattr(star, "reserved", False):
                 filtered.add_tool(tool)
                 continue
-            if include_native_tools and self._is_native_plugin_allowed(star, event):
+            if (
+                include_native_tools
+                and getattr(tool, "active", True)
+                and self._is_native_plugin_allowed(star, event)
+            ):
                 filtered.add_tool(
                     LimitedPluginFunctionTool(tool, limiter)
                     if limiter and limiter.enabled
@@ -252,7 +254,9 @@ class CommandRegistry:
     def _is_native_plugin_allowed(self, star, event) -> bool:
         if getattr(star, "reserved", False):
             return True
-        return self._is_active_and_allowed(star, event) and not self._is_command2llm(star)
+        return self._is_active_and_allowed(star, event) and not self._is_command2llm(
+            star
+        )
 
     def _is_active_and_allowed(self, star, event) -> bool:
         if not getattr(star, "activated", True) or getattr(star, "disabled", False):
@@ -307,23 +311,21 @@ class CommandRegistry:
 
     def _normalize_identifier(self, value: str) -> str:
         normalized = "".join(
-            character.lower()
-            for character in str(value or "")
-            if character.isalnum()
+            character.lower() for character in str(value or "") if character.isalnum()
         )
         prefix = "astrbotplugin"
-        return normalized[len(prefix) :] if normalized.startswith(prefix) else normalized
+        return (
+            normalized[len(prefix) :] if normalized.startswith(prefix) else normalized
+        )
 
     def _get_plugin_description(self, star) -> str:
-        description = (
-            getattr(star, "short_desc", "")
-            or getattr(star, "desc", "")
-            or ""
-        )
+        description = getattr(star, "short_desc", "") or getattr(star, "desc", "") or ""
         return " ".join(str(description).split())[:500]
 
     def _get_handler_description(self, handler) -> str:
-        description = getattr(handler, "desc", "") or inspect.getdoc(handler.handler) or ""
+        description = (
+            getattr(handler, "desc", "") or inspect.getdoc(handler.handler) or ""
+        )
         return " ".join(str(description).split())[:500]
 
     def _get_handler_usage(self, command_name: str, handler) -> str:
@@ -400,7 +402,9 @@ class ExecuteCommandTool:
             return "命令不能为空"
 
         self.last_command = command
-        registered_command = registered_command or self._find_registered_command(command)
+        registered_command = registered_command or self._find_registered_command(
+            command
+        )
         if registered_command is None:
             return f"未找到可同步执行的命令: {command}"
         if not self._matches_command(command, registered_command):
@@ -439,7 +443,9 @@ class ExecuteCommandTool:
                 **parsed_params,
             )
             await self._consume_handler_result(handler_result, capture_result)
-            await self._capture_event_result(command_event, capture_result, sent_result_ids)
+            await self._capture_event_result(
+                command_event, capture_result, sent_result_ids
+            )
             self.completed = True
 
             if agent_mode:
@@ -474,30 +480,24 @@ class ExecuteCommandTool:
         return any(command == name or command.startswith(f"{name} ") for name in names)
 
     def _create_command_event(self, event, command: str):
+        command_event = copy.copy(event)
         message_obj = copy.copy(event.message_obj)
         message_obj.message_str = command
         message_obj.message = [Plain(text=command)]
         message_obj.session_id = event.session_id
 
-        event_class = event.__class__
-        event_kwargs = {
-            "message_str": command,
-            "message_obj": message_obj,
-            "platform_meta": event.platform_meta,
-            "session_id": event.session_id,
-        }
-        signature = inspect.signature(event_class.__init__)
-        if "bot" in signature.parameters and hasattr(event, "bot"):
-            event_kwargs["bot"] = event.bot
-
-        command_event = event_class(**event_kwargs)
-        command_event.role = getattr(event, "role", "member")
+        command_event.message_str = command
+        command_event.message_obj = message_obj
+        command_event._extras = copy.copy(getattr(event, "_extras", {}))
+        command_event._extras.pop("parsed_params", None)
+        if hasattr(command_event, "_result"):
+            command_event._result = None
+        if hasattr(command_event, "_force_stopped"):
+            command_event._force_stopped = False
+        if hasattr(command_event, "_has_send_oper"):
+            command_event._has_send_oper = False
         command_event.is_wake = True
         command_event.is_at_or_wake_command = True
-        if hasattr(event, "plugins_name"):
-            command_event.plugins_name = event.plugins_name
-        if hasattr(event, "_extras"):
-            command_event._extras = copy.copy(event._extras)
         return command_event
 
     async def _validate_event_filters(
@@ -528,6 +528,9 @@ class ExecuteCommandTool:
     async def _consume_handler_result(self, handler_result, capture_result) -> None:
         if inspect.isasyncgen(handler_result):
             async for result in handler_result:
+                await capture_result(result)
+        elif inspect.isgenerator(handler_result):
+            for result in handler_result:
                 await capture_result(result)
         elif inspect.isawaitable(handler_result):
             await capture_result(await handler_result)
@@ -645,8 +648,7 @@ class PluginToolCallLimiter:
 
         self._calls_in_round += 1
         final_round = (
-            self.max_call_rounds >= 0
-            and self._round_count >= self.max_call_rounds
+            self.max_call_rounds >= 0 and self._round_count >= self.max_call_rounds
         )
         return True, "", final_round
 

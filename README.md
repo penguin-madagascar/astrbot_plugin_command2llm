@@ -1,4 +1,4 @@
-# AstrBot LLM2Command 插件
+# AstrBot Command2LLM 插件
 
 将已启用插件的普通命令桥接给 LLM。插件同时提供稳定的单命令路由模式，以及复用 AstrBot 原生 Agent 的多轮工具调用模式。
 
@@ -24,7 +24,7 @@
 - `listen_mode=global` 下的普通群聊消息会先由 `judge_provider_id` 根据实际能力目录判断是否需要启动 Agent。
 - 纯文本命令结果回传给模型生成最终回复；图片、卡片等富媒体会原样发送一次，并向模型返回已发送标记。
 
-多轮次数、工具超时、工具 schema 模式、会话历史、人设和结果持久化均沿用 AstrBot 全局配置。
+Agent 总步数、工具超时、工具 schema 模式、会话历史、人设和结果持久化沿用 AstrBot 全局配置；插件工具还可单独设置调用上限。
 
 ## 配置
 
@@ -35,8 +35,12 @@
 - `judge_provider_id`：单命令结构化路由和 `global` 多轮预判使用的模型；留空时使用当前会话模型。
 - `enable_multi_tool_agent`：启用多轮工具调用，默认关闭。
 - `agent_tool_types`：多选允许的插件工具类型：
-  - `command`：普通 `@filter.command` 命令。
+  - `command`：普通 `@filter.command` 命令，默认启用。
   - `native_tool`：插件原生 `FunctionTool`。
+- `multi_tool_limits`：仅在多轮模式中限制本插件管理的工具调用：
+  - `max_calls_per_round`：一次 LLM 响应允许的插件工具调用数。
+  - `max_call_rounds`：一次回复允许发生插件工具调用的 LLM 轮数。
+  - 两项填负数均表示不额外限制，AstrBot 全局限制仍然生效。
 - `show_builtin_cmds`：是否把 AstrBot 保留插件的普通命令加入命令目录。
 - `plugin_blacklist`：Dashboard 插件选择器。黑名单插件的普通命令和原生工具都不会参与判断或调用。
 
@@ -65,14 +69,6 @@
 - 目标运行环境：AstrBot 4.25.3。
 - 单命令模式依赖 `llm_generate` 和 `get_current_chat_provider_id`。
 - 多轮模式通过 `on_llm_request` 接入 AstrBot 主 Agent，不维护私有 tool-calls 状态机。
-
-## 开发验证
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-测试覆盖结构化路由、插件过滤、黑名单、工具类型组合、多次命令调用、权限/参数过滤，以及纯文本和富媒体结果策略。
 
 ## 许可证
 

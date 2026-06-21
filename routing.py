@@ -20,7 +20,9 @@ def _parse_json_object(response_text: str) -> dict:
     return payload
 
 
-def parse_route_decision(response_text: str, command_count: int) -> RouteDecision | None:
+def parse_route_decision(
+    response_text: str, command_count: int
+) -> RouteDecision | None:
     """Parse the command router's JSON response."""
     payload = _parse_json_object(response_text)
     command_id = payload.get("command_id")
